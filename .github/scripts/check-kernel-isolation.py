@@ -5,6 +5,7 @@ define them with baseline instructions only.
 """
 
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -23,9 +24,25 @@ EXTRA_ISA = {"tzcnt", "lzcnt", "popcnt", "crc32"}
 
 
 def run(*command):
-    return subprocess.run(
-        command, check=True, capture_output=True, text=True, errors="replace"
-    ).stdout
+    result = subprocess.run(
+        command, capture_output=True, text=True, errors="replace"
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"{' '.join(command)} failed with exit status "
+            f"{result.returncode}:\n{result.stderr}{result.stdout[:2000]}"
+        )
+    return result.stdout
+
+
+def nm_command():
+    """nm that takes the GNU options.  The cctools nm of the conda macOS
+    compilers does not, use llvm-nm or the Xcode nm there."""
+    if sys.platform != "darwin":
+        return ("nm",)
+    if shutil.which("llvm-nm"):
+        return ("llvm-nm",)
+    return ("xcrun", "nm")
 
 
 def private_symbol(name, isa):
@@ -44,7 +61,7 @@ def kernel_entry(name, isa):
 
 def check_nm(path, isa):
     output = run(
-        "nm",
+        *nm_command(),
         "--defined-only",
         "--extern-only",
         "--demangle",
@@ -90,10 +107,15 @@ def check_coff(path, isa):
             match = INSTRUCTION.match(line)
             if match:
                 bodies[current].append(match.groups())
+    missing = [name for name in sorted(shared) if not bodies.get(name)]
+    if missing:
+        report_missing_disassembly(path, missing, shared, bodies, symbols, output)
+        raise ValueError(
+            f"No disassembly for {len(missing)} of {len(shared)} shared "
+            f"functions in {path}, first {missing[0]}"
+        )
     errors = []
     for name in sorted(shared):
-        if not bodies.get(name):
-            raise ValueError(f"No disassembly for shared function {name}")
         for raw, mnemonic in bodies[name]:
             # C4 and C5 start VEX instructions, 62 starts EVEX ones.
             if (
@@ -105,6 +127,41 @@ def check_coff(path, isa):
                 errors.append(f"non-baseline instruction {mnemonic}: {name}")
                 break
     return errors
+
+
+def report_missing_disassembly(path, missing, shared, bodies, symbols, disasm):
+    """Print what dumpbin shows about functions without disassembly."""
+
+    def show(title, lines, hits, before=3, after=8):
+        print(f"  {title}: {len(hits)} matching lines", file=sys.stderr)
+        for i in hits[:2]:
+            for line in lines[max(0, i - before) : i + after]:
+                print(f"    | {line}", file=sys.stderr)
+            print("    | ...", file=sys.stderr)
+
+    print(f"::group::Missing disassembly in {path}", file=sys.stderr)
+    print(
+        f"{len(shared)} shared functions, {len(missing)} without "
+        f"disassembly, {len(bodies)} labels parsed",
+        file=sys.stderr,
+    )
+    print(f"labels with instructions: {sum(map(bool, bodies.values()))}",
+          file=sys.stderr)
+    print("first parsed labels:", file=sys.stderr)
+    for name in list(bodies)[:10]:
+        print(f"  {name} ({len(bodies[name])} instructions)", file=sys.stderr)
+    symlines = symbols.splitlines()
+    dislines = disasm.splitlines()
+    for name in missing[:5]:
+        print(f"{name}:", file=sys.stderr)
+        show("/symbols", symlines,
+             [i for i, line in enumerate(symlines) if name in line], 2, 3)
+        show("/disasm", dislines,
+             [i for i, line in enumerate(dislines) if name in line])
+    print("first 40 lines of /disasm:", file=sys.stderr)
+    for line in dislines[:40]:
+        print(f"    | {line}", file=sys.stderr)
+    print("::endgroup::", file=sys.stderr)
 
 
 def main():
