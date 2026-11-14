@@ -25,7 +25,6 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
-#include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <diffpy/mathutils.hpp>
 #include <diffpy/srreal/CrystalStructureAdapter.hpp>
@@ -35,7 +34,6 @@
 #include "test_helpers.hpp"
 
 using namespace diffpy::srreal;
-using Catch::Matchers::WithinAbs;
 
 namespace {
 
@@ -144,21 +142,14 @@ std::vector<Bond> generated(BaseBondGenerator& bnds) {
   return rv;
 }
 
-/// Tolerance of the bond coordinates.  Release builds use -ffast-math, with
-/// LTO the generator inlines Lattice::cartesian and FMA can round its copies
-/// differently from the out-of-line one the reference calls.
-constexpr double COORD_EPS = 1e-12;
-
-bool sameCoordinate(double a, double e) {
-  return std::fabs(a - e) <= COORD_EPS;
-}
+/// Equality of the bond vectors.
+const diffpy::mathutils::EpsilonEqual allclose(1e-12);
 
 bool sameBond(const Bond& a, const Bond& e) {
   bool rv = (a.site0 == e.site0) && (a.site1 == e.site1) &&
-            (std::fabs(a.distance - e.distance) <= 1e-14 * e.distance);
+            (std::fabs(a.distance - e.distance) <= 1e-14 * e.distance) &&
+            allclose(a.r1, e.r1) && allclose(a.r01, e.r01);
   for (int k = 0; k < 3; ++k) {
-    rv = rv && sameCoordinate(a.r1[k], e.r1[k]) &&
-         sameCoordinate(a.r01[k], e.r01[k]);
     for (int l = 0; l < 3; ++l) rv = rv && (a.u1(k, l) == e.u1(k, l));
   }
   return rv;
@@ -175,10 +166,8 @@ void checkSameBonds(const std::vector<Bond>& actual,
   const Bond& e = expected[i];
   CHECK(a.site0 == e.site0);
   CHECK(a.site1 == e.site1);
-  for (int k = 0; k < 3; ++k) {
-    CHECK_THAT(a.r1[k], WithinAbs(e.r1[k], COORD_EPS));
-    CHECK_THAT(a.r01[k], WithinAbs(e.r01[k], COORD_EPS));
-  }
+  CHECK(allclose(a.r1, e.r1));
+  CHECK(allclose(a.r01, e.r01));
   CHECK(std::fabs(a.distance - e.distance) <= 1e-14 * e.distance);
   for (int k = 0; k < 3; ++k) {
     for (int l = 0; l < 3; ++l) CHECK(a.u1(k, l) == e.u1(k, l));
