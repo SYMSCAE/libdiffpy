@@ -2,23 +2,23 @@
 
 GCC and Clang objects must define no shared functions. MSVC objects may
 define them with baseline instructions only.
+
+The LLVM tools read the ELF, Mach-O and COFF objects alike, the CI
+environment installs them with llvm-tools.
 """
 
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 OBJECT_NAME = re.compile(
-    r"CalculationKernel(SSE2|AVX2|AVX512|NEON)(?:\.cpp)?\.(?:o|obj)$"
+    r"CalculationKernel(SSE2|AVX2|AVX512|NEON)(?:\.cpp)?\.(o|obj)$"
 )
-COFF_FUNCTION = re.compile(
-    r"SECT[0-9A-F]+\s+notype \(\)\s+External\s+\| (\S+)"
-)
-INSTRUCTION = re.compile(
-    r"^\s+[0-9A-F]+:\s+((?:[0-9A-F]{2}\s+)+)([a-z?][a-z0-9?]*)(?:\s|$)"
-)
+NM_LINE = re.compile(r"(.+) ([A-Za-z?]) [0-9a-fA-F]*(?: .*)?")
+FUNCTION_TYPES = {"T", "W", "i", "I"}
+LABEL = re.compile(r"^[0-9a-f]+ <(.+)>:$")
+INSTRUCTION = re.compile(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*([a-z]\S*)")
 # Instructions above the baseline that have no VEX prefix.
 EXTRA_ISA = {"tzcnt", "lzcnt", "popcnt", "crc32"}
 
@@ -30,38 +30,26 @@ def run(*command):
     if result.returncode != 0:
         raise SystemExit(
             f"{' '.join(command)} failed with exit status "
-            f"{result.returncode}:\n{result.stderr}{result.stdout[:2000]}"
+            f"{result.returncode}:\n{result.stderr}"
         )
     return result.stdout
 
 
-def nm_command():
-    """nm that takes the GNU options.  The cctools nm of the conda macOS
-    compilers does not, use llvm-nm or the Xcode nm there."""
-    if sys.platform != "darwin":
-        return ("nm",)
-    if shutil.which("llvm-nm"):
-        return ("llvm-nm",)
-    return ("xcrun", "nm")
-
-
 def private_symbol(name, isa):
-    namespace = f"xsimd_{isa.lower()}"
-    if f"{namespace}::" in name or f"@{namespace}@@" in name:
-        return True
-    return "(anonymous namespace)" in name or "?A0x" in name
-
-
-def kernel_entry(name, isa):
-    entry = f"{isa.lower()}CalculationKernel"
-    return name == f"diffpy::srreal::kernels::{entry}()" or name.startswith(
-        f"?{entry}@kernels@srreal@diffpy@@"
+    return (
+        f"xsimd_{isa.lower()}::" in name
+        or "(anonymous namespace)" in name
+        or "`anonymous namespace'" in name
     )
 
 
-def check_nm(path, isa):
+def kernel_entry(name, isa):
+    return f"diffpy::srreal::kernels::{isa.lower()}CalculationKernel(" in name
+
+
+def defined_functions(path):
     output = run(
-        *nm_command(),
+        "llvm-nm",
         "--defined-only",
         "--extern-only",
         "--demangle",
@@ -70,98 +58,74 @@ def check_nm(path, isa):
     )
     functions = []
     for line in output.splitlines():
-        match = re.fullmatch(r"(.+) ([A-Za-z?]) [0-9a-fA-F]+(?: .*)?", line)
+        match = NM_LINE.fullmatch(line)
         if not match:
-            raise ValueError(f"Unrecognized nm output: {line}")
+            raise ValueError(f"Unrecognized llvm-nm output: {line}")
         name, kind = match.groups()
-        if kind in {"T", "W", "i", "I"}:
+        if kind in FUNCTION_TYPES:
             functions.append(name)
-    if not any(kernel_entry(name, isa) for name in functions):
-        raise ValueError(f"Missing {isa} entry point in {path}")
-    return [
-        f"shared code symbol: {name}"
-        for name in functions
-        if not private_symbol(name, isa) and not kernel_entry(name, isa)
-    ]
+    return functions
 
 
-def check_coff(path, isa):
-    symbols = run("dumpbin", "/nologo", "/symbols", str(path))
-    functions = COFF_FUNCTION.findall(symbols)
-    if not any(kernel_entry(name, isa) for name in functions):
-        raise ValueError(f"Missing {isa} entry point in {path} (LTO object?)")
-    shared = {
-        name
-        for name in functions
-        if not private_symbol(name, isa) and not kernel_entry(name, isa)
-    }
-    output = run("dumpbin", "/nologo", "/disasm", str(path))
+def disassembly(path):
+    """Instructions of the functions in path as (bytes, mnemonic) by name."""
+    output = run(
+        "llvm-objdump",
+        "--disassemble",
+        "--demangle",
+        "--x86-asm-syntax=intel",
+        str(path),
+    )
     bodies = {}
     current = None
     for line in output.splitlines():
-        # A function starts with its decorated name.
-        if line and not line[0].isspace() and line.endswith(":"):
-            current = line.split(" ", 1)[0].rstrip(":")
-            bodies[current] = []
-        elif current is not None:
-            match = INSTRUCTION.match(line)
-            if match:
-                bodies[current].append(match.groups())
-    missing = [name for name in sorted(shared) if not bodies.get(name)]
-    if missing:
-        report_missing_disassembly(path, missing, shared, bodies, symbols, output)
-        raise ValueError(
-            f"No disassembly for {len(missing)} of {len(shared)} shared "
-            f"functions in {path}, first {missing[0]}"
-        )
-    errors = []
-    for name in sorted(shared):
-        for raw, mnemonic in bodies[name]:
-            # C4 and C5 start VEX instructions, 62 starts EVEX ones.
-            if (
-                raw.split()[0] in {"C4", "C5", "62"}
-                or mnemonic.startswith("v")
-                or mnemonic in EXTRA_ISA
-                or "?" in mnemonic
-            ):
-                errors.append(f"non-baseline instruction {mnemonic}: {name}")
-                break
-    return errors
+        label = LABEL.match(line)
+        if label:
+            current = bodies.setdefault(label[1], [])
+            continue
+        match = INSTRUCTION.match(line)
+        if match and current is not None:
+            current.append(match.groups())
+    return bodies
 
 
-def report_missing_disassembly(path, missing, shared, bodies, symbols, disasm):
-    """Print what dumpbin shows about functions without disassembly."""
+def non_baseline(body):
+    for raw, mnemonic in body:
+        # c4 and c5 start VEX instructions, 62 starts EVEX ones.
+        if (
+            raw.split()[0] in {"c4", "c5", "62"}
+            or mnemonic.startswith("v")
+            or mnemonic in EXTRA_ISA
+        ):
+            return mnemonic
+    return None
 
-    def show(title, lines, hits, before=3, after=8):
-        print(f"  {title}: {len(hits)} matching lines", file=sys.stderr)
-        for i in hits[:2]:
-            for line in lines[max(0, i - before) : i + after]:
-                print(f"    | {line}", file=sys.stderr)
-            print("    | ...", file=sys.stderr)
 
-    print(f"::group::Missing disassembly in {path}", file=sys.stderr)
-    print(
-        f"{len(shared)} shared functions, {len(missing)} without "
-        f"disassembly, {len(bodies)} labels parsed",
-        file=sys.stderr,
+def check(path, isa, msvc):
+    functions = defined_functions(path)
+    if not any(kernel_entry(name, isa) for name in functions):
+        raise ValueError(f"Missing {isa} entry point in {path} (LTO object?)")
+    shared = sorted(
+        {
+            name
+            for name in functions
+            if not private_symbol(name, isa) and not kernel_entry(name, isa)
+        }
     )
-    print(f"labels with instructions: {sum(map(bool, bodies.values()))}",
-          file=sys.stderr)
-    print("first parsed labels:", file=sys.stderr)
-    for name in list(bodies)[:10]:
-        print(f"  {name} ({len(bodies[name])} instructions)", file=sys.stderr)
-    symlines = symbols.splitlines()
-    dislines = disasm.splitlines()
-    for name in missing[:5]:
-        print(f"{name}:", file=sys.stderr)
-        show("/symbols", symlines,
-             [i for i, line in enumerate(symlines) if name in line], 2, 3)
-        show("/disasm", dislines,
-             [i for i, line in enumerate(dislines) if name in line])
-    print("first 40 lines of /disasm:", file=sys.stderr)
-    for line in dislines[:40]:
-        print(f"    | {line}", file=sys.stderr)
-    print("::endgroup::", file=sys.stderr)
+    if not msvc:
+        return [f"shared code symbol: {name}" for name in shared]
+    bodies = disassembly(path)
+    errors = []
+    for name in shared:
+        if not bodies.get(name):
+            raise ValueError(
+                f"No disassembly for shared function {name} in {path}, "
+                f"{len(bodies)} functions disassembled"
+            )
+        mnemonic = non_baseline(bodies[name])
+        if mnemonic:
+            errors.append(f"non-baseline instruction {mnemonic}: {name}")
+    return errors
 
 
 def main():
@@ -173,8 +137,7 @@ def main():
         if not match:
             continue
         found = True
-        check = check_coff if path.suffix == ".obj" else check_nm
-        errors = check(path, match[1])
+        errors = check(path, match[1], msvc=match[2] == "obj")
         if errors:
             failures.extend(f"{path}: {error}" for error in errors)
         else:
